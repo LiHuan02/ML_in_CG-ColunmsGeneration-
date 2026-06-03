@@ -140,7 +140,7 @@ def print_summary_table(results):
 
 
 if __name__ == '__main__':
-    trip_sizes = (20, 30)
+    trip_sizes = (40, 80)
     num_instances = 2
 
     print("=" * 60)
