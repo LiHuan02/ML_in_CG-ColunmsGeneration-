@@ -18,6 +18,8 @@ import os
 import sys
 import argparse
 import time
+import csv
+import json
 import numpy as np
 import torch
 import torch.nn as nn
@@ -32,7 +34,7 @@ from gnn.bipartite_gnn import BipartiteGNN
 from gnn.dataset import VCSPBipartiteDataset
 
 
-def compute_metrics(logits_list, labels_list, mask_list, threshold=0.0):
+def compute_metrics(logits_list, labels_list, mask_list, threshold=0.5):
     """Compute classification metrics on the full dataset.
 
     Args:
@@ -50,7 +52,7 @@ def compute_metrics(logits_list, labels_list, mask_list, threshold=0.0):
     for logits, labels, mask in zip(logits_list, labels_list, mask_list):
         new_logits = logits[mask]  # only predict for new columns
         probs = torch.sigmoid(new_logits)
-        preds = (probs > 0.5).long()
+        preds = (probs > threshold).long()
         all_preds.append(preds)
         all_labels.append(labels)
 
@@ -78,7 +80,7 @@ def compute_metrics(logits_list, labels_list, mask_list, threshold=0.0):
     }
 
 
-def train_epoch(model, dataloader, optimizer, criterion, device, pos_weight):
+def train_epoch(model, dataloader, optimizer, criterion, device, grad_accum_steps):
     """Train for one epoch.
 
     Since graphs have different sizes, we can't batch them in the traditional sense.
@@ -88,10 +90,11 @@ def train_epoch(model, dataloader, optimizer, criterion, device, pos_weight):
     total_loss = 0.0
     n_samples = 0
 
-    batch_size = 16  # Paper's batch size
+    optimizer.zero_grad()
     accumulated_logits = []
     accumulated_labels = []
     accumulated_masks = []
+    pending_steps = 0
 
     for i, batch_data in enumerate(dataloader):
         # Handle both DataLoader and list input
@@ -132,12 +135,14 @@ def train_epoch(model, dataloader, optimizer, criterion, device, pos_weight):
 
         # Average loss over samples in this batch, then backprop
         batch_loss = torch.stack(sample_losses).mean()
-        batch_loss.backward()
+        (batch_loss / max(1, grad_accum_steps)).backward()
+        pending_steps += 1
 
-        # Step optimizer every batch_size samples
-        if (i + 1) % batch_size == 0 or (i + 1) == len(dataloader):
+        # Step optimizer every grad_accum_steps graphs
+        if pending_steps >= grad_accum_steps or (i + 1) == len(dataloader):
             optimizer.step()
             optimizer.zero_grad()
+            pending_steps = 0
 
         total_loss += batch_loss.item() * len(sample_losses)
         n_samples += len(sample_losses)
@@ -145,6 +150,31 @@ def train_epoch(model, dataloader, optimizer, criterion, device, pos_weight):
     metrics = compute_metrics(accumulated_logits, accumulated_labels, accumulated_masks)
 
     return total_loss / max(n_samples, 1), metrics
+
+
+def set_random_seed(seed):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def write_history_csv(path, history):
+    fieldnames = [
+        'epoch', 'elapsed', 'train_loss', 'val_loss',
+        'train_recall', 'train_tnr', 'train_precision', 'train_balanced_accuracy',
+        'val_recall', 'val_tnr', 'val_precision', 'val_balanced_accuracy',
+    ]
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in history:
+            writer.writerow({k: row.get(k, '') for k in fieldnames})
+
+
+def write_json(path, payload):
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
 
 
 @torch.no_grad()
@@ -206,12 +236,25 @@ def main():
                         help='GNN message-passing iterations K (default: 1)')
     parser.add_argument('--val-split', type=float, default=0.25,
                         help='Validation split ratio (default: 0.25)')
+    parser.add_argument('--batch-size', type=int, default=16,
+                        help='Gradient accumulation batch size in graphs (default: 16)')
+    parser.add_argument('--seed', type=int, default=42,
+                        help='Random seed for split and training (default: 42)')
+    parser.add_argument('--patience', type=int, default=50,
+                        help='Early stopping patience in epochs (default: 50, <=0 disables)')
+    parser.add_argument('--min-delta', type=float, default=1e-4,
+                        help='Minimum validation balanced-accuracy improvement (default: 1e-4)')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Resume from a checkpoint path')
+    parser.add_argument('--save-every', type=int, default=0,
+                        help='Save epoch checkpoint every N epochs (default: disabled)')
     parser.add_argument('--device', type=str, default='cpu',
                         help='Device: cpu or cuda')
     parser.add_argument('--no-normalize', action='store_true',
                         help='Disable feature normalization')
 
     args = parser.parse_args()
+    set_random_seed(args.seed)
 
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -225,7 +268,7 @@ def main():
     train_size = len(full_dataset) - val_size
     train_dataset, val_dataset = random_split(
         full_dataset, [train_size, val_size],
-        generator=torch.Generator().manual_seed(42)
+        generator=torch.Generator().manual_seed(args.seed)
     )
     print(f"Train: {train_size}, Val: {val_size}")
 
@@ -256,7 +299,20 @@ def main():
 
     # Training loop
     best_val_bal_acc = 0.0
+    start_epoch = 0
+    epochs_without_improve = 0
+    history = []
     os.makedirs(args.output, exist_ok=True)
+
+    if args.resume:
+        checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        if 'optimizer_state_dict' in checkpoint:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = int(checkpoint.get('epoch', -1)) + 1
+        best_val_bal_acc = float(checkpoint.get('best_val_balanced_accuracy', 0.0))
+        history = list(checkpoint.get('history', []))
+        print(f"Resumed from {args.resume} at epoch {start_epoch}")
 
     print(f"\n{'=' * 60}")
     print(f"Training GNN for {args.epochs} epochs")
@@ -264,15 +320,31 @@ def main():
     print(f"  hidden_dim={args.hidden_dim}, K={args.num_iterations}")
     print(f"{'=' * 60}")
 
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         start_t = time.time()
 
         train_loss, train_metrics = train_epoch(
-            model, train_loader, optimizer, criterion, device, args.pos_weight
+            model, train_loader, optimizer, criterion, device, args.batch_size
         )
         val_loss, val_metrics = evaluate(model, val_loader, criterion, device)
 
         elapsed = time.time() - start_t
+
+        row = {
+            'epoch': epoch + 1,
+            'elapsed': elapsed,
+            'train_loss': train_loss,
+            'val_loss': val_loss,
+            'train_recall': train_metrics['recall'],
+            'train_tnr': train_metrics['tnr'],
+            'train_precision': train_metrics['precision'],
+            'train_balanced_accuracy': train_metrics['balanced_accuracy'],
+            'val_recall': val_metrics['recall'],
+            'val_tnr': val_metrics['tnr'],
+            'val_precision': val_metrics['precision'],
+            'val_balanced_accuracy': val_metrics['balanced_accuracy'],
+        }
+        history.append(row)
 
         # Print progress
         if (epoch + 1) % 10 == 0 or epoch == 0:
@@ -283,9 +355,16 @@ def main():
                   f"Prec: {val_metrics['precision']:.3f} | "
                   f"Time: {elapsed:.1f}s")
 
-        # Save best model
-        if val_metrics['balanced_accuracy'] > best_val_bal_acc:
-            best_val_bal_acc = val_metrics['balanced_accuracy']
+        score_metrics = val_metrics if val_size > 0 else train_metrics
+        current_score = score_metrics['balanced_accuracy']
+        best_model_path = os.path.join(args.output, 'best_model.pt')
+        improved = (
+            not os.path.exists(best_model_path)
+            or current_score > best_val_bal_acc + args.min_delta
+        )
+        if improved:
+            best_val_bal_acc = current_score
+            epochs_without_improve = 0
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
@@ -293,8 +372,44 @@ def main():
                 'val_metrics': val_metrics,
                 'train_metrics': train_metrics,
                 'feature_stats': full_dataset._feature_stats,
+                'best_val_balanced_accuracy': best_val_bal_acc,
+                'history': history,
+                'args': vars(args),
             }, os.path.join(args.output, 'best_model.pt'))
             print(f"  -> Saved best model (bal_acc={best_val_bal_acc:.4f})")
+        else:
+            epochs_without_improve += 1
+
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'val_metrics': val_metrics,
+            'train_metrics': train_metrics,
+            'feature_stats': full_dataset._feature_stats,
+            'best_val_balanced_accuracy': best_val_bal_acc,
+            'history': history,
+            'args': vars(args),
+        }, os.path.join(args.output, 'last_model.pt'))
+
+        if args.save_every > 0 and (epoch + 1) % args.save_every == 0:
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_metrics': val_metrics,
+                'train_metrics': train_metrics,
+                'feature_stats': full_dataset._feature_stats,
+                'best_val_balanced_accuracy': best_val_bal_acc,
+                'history': history,
+                'args': vars(args),
+            }, os.path.join(args.output, f'epoch_{epoch + 1:04d}.pt'))
+
+        write_history_csv(os.path.join(args.output, 'history.csv'), history)
+
+        if args.patience > 0 and epochs_without_improve >= args.patience:
+            print(f"Early stopping after {epochs_without_improve} epochs without improvement")
+            break
 
     # Final evaluation
     print(f"\n{'=' * 60}")
@@ -326,6 +441,24 @@ def main():
         full_dataset.save_normalization_stats(
             os.path.join(args.output, 'norm_stats.npz')
         )
+
+    summary = {
+        'args': vars(args),
+        'num_samples': len(full_dataset),
+        'train_size': train_size,
+        'val_size': val_size,
+        'best_val_balanced_accuracy': best_val_bal_acc,
+        'final_train_metrics': final_train_metrics,
+        'final_val_metrics': final_val_metrics,
+        'model_parameters': total_params,
+        'history_csv': os.path.join(args.output, 'history.csv'),
+        'best_model': os.path.join(args.output, 'best_model.pt'),
+        'last_model': os.path.join(args.output, 'last_model.pt'),
+        'norm_stats': os.path.join(args.output, 'norm_stats.npz'),
+    }
+    write_json(os.path.join(args.output, 'training_summary.json'), summary)
+    print(f"Saved history: {os.path.join(args.output, 'history.csv')}")
+    print(f"Saved summary: {os.path.join(args.output, 'training_summary.json')}")
 
 
 if __name__ == '__main__':

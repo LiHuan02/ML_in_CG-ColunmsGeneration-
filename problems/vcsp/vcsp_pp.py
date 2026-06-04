@@ -1,4 +1,5 @@
 import numpy as np
+from bisect import bisect_left
 from core.pp import PricingProblem
 
 
@@ -86,6 +87,25 @@ class VCSPPricingProblem(PricingProblem):
     def set_dual_values(self, dual_values):
         self.dual_values = dual_values
 
+    def _departure_indices_between(self, from_time, to_time):
+        """Return departure-time indices h with from_time <= h < to_time."""
+        times = self.instance.departure_times
+        start = bisect_left(times, from_time)
+        end = bisect_left(times, to_time)
+        return range(start, end)
+
+    def _bus_count_dual_contribution(self, from_time, to_time):
+        """Reduced-cost contribution for vehicle occupancy.
+
+        RMP uses sum(q_hp theta_p) - B <= 0. OR-Tools returns a nonpositive
+        raw dual for that constraint; VCSPRMP stores delta = -raw_dual >= 0.
+        Therefore vehicle occupancy contributes +delta to a column reduced cost.
+        """
+        if self.dual_values is None:
+            return 0.0
+        return sum(self.dual_values['delta'][h_idx]
+                   for h_idx in self._departure_indices_between(from_time, to_time))
+
     def _get_arc_actual_cost(self, arc):
         """Return the actual operational cost of an arc."""
         return arc['cost']
@@ -104,9 +124,7 @@ class VCSPPricingProblem(PricingProblem):
             rc -= dv['alpha'][d_id]
             from_time = self.network.nodes[from_nid]['time']
             to_time = self.network.nodes[to_nid]['time']
-            for h_idx, h in enumerate(self.instance.departure_times):
-                if from_time <= h < to_time:
-                    rc -= dv['delta'][h_idx]
+            rc += self._bus_count_dual_contribution(from_time, to_time)
 
         elif arc_type == self.network.ARC_INTER_TRIP_DRIVING:
             trip_id = arc['trip_id']
@@ -116,9 +134,7 @@ class VCSPPricingProblem(PricingProblem):
                 rc -= dv['gamma'][from_node['trip_id']]
             from_time = self.network.nodes[from_nid]['time']
             to_time = self.network.nodes[to_nid]['time']
-            for h_idx, h in enumerate(self.instance.departure_times):
-                if from_time <= h < to_time:
-                    rc -= dv['delta'][h_idx]
+            rc += self._bus_count_dual_contribution(from_time, to_time)
 
         elif arc_type == self.network.ARC_START_OF_DUTY:
             if arc['is_driving']:
@@ -127,9 +143,7 @@ class VCSPPricingProblem(PricingProblem):
                     rc -= dv['beta'][to_node['trip_id']]
                 from_time = to_node['time'] - arc['time']
                 to_time = to_node['time']
-                for h_idx, h in enumerate(self.instance.departure_times):
-                    if from_time <= h < to_time:
-                        rc -= dv['delta'][h_idx]
+                rc += self._bus_count_dual_contribution(from_time, to_time)
 
         elif arc_type == self.network.ARC_END_OF_DUTY:
             if arc['is_driving']:
@@ -138,9 +152,7 @@ class VCSPPricingProblem(PricingProblem):
                     rc -= dv['gamma'][from_node['trip_id']]
                 from_time = self.network.nodes[from_nid]['time']
                 to_time = from_time + arc['time']
-                for h_idx, h in enumerate(self.instance.departure_times):
-                    if from_time <= h < to_time:
-                        rc -= dv['delta'][h_idx]
+                rc += self._bus_count_dual_contribution(from_time, to_time)
 
         return rc
 
@@ -166,9 +178,8 @@ class VCSPPricingProblem(PricingProblem):
             new_d_trips[arc['d_trip_id']] = True
             from_time = self.network.nodes[from_nid]['time']
             to_time = self.network.nodes[to_nid]['time']
-            for h in self.instance.departure_times:
-                if from_time <= h < to_time:
-                    new_q_times[h] = True
+            for h_idx in self._departure_indices_between(from_time, to_time):
+                new_q_times[self.instance.departure_times[h_idx]] = True
 
         elif arc_type == self.network.ARC_INTER_TRIP_DRIVING:
             new_f_trips[arc['trip_id']] = True
@@ -177,9 +188,8 @@ class VCSPPricingProblem(PricingProblem):
                 new_g_trips[from_node['trip_id']] = True
             from_time = self.network.nodes[from_nid]['time']
             to_time = self.network.nodes[to_nid]['time']
-            for h in self.instance.departure_times:
-                if from_time <= h < to_time:
-                    new_q_times[h] = True
+            for h_idx in self._departure_indices_between(from_time, to_time):
+                new_q_times[self.instance.departure_times[h_idx]] = True
 
         elif arc_type == self.network.ARC_START_OF_DUTY:
             if arc['is_driving']:
@@ -188,9 +198,8 @@ class VCSPPricingProblem(PricingProblem):
                     new_f_trips[to_node['trip_id']] = True
                 from_time = to_node['time'] - arc['time']
                 to_time = to_node['time']
-                for h in self.instance.departure_times:
-                    if from_time <= h < to_time:
-                        new_q_times[h] = True
+                for h_idx in self._departure_indices_between(from_time, to_time):
+                    new_q_times[self.instance.departure_times[h_idx]] = True
 
         elif arc_type == self.network.ARC_END_OF_DUTY:
             if arc['is_driving']:
@@ -199,9 +208,8 @@ class VCSPPricingProblem(PricingProblem):
                     new_g_trips[from_node['trip_id']] = True
                 from_time = self.network.nodes[from_nid]['time']
                 to_time = from_time + arc['time']
-                for h in self.instance.departure_times:
-                    if from_time <= h < to_time:
-                        new_q_times[h] = True
+                for h_idx in self._departure_indices_between(from_time, to_time):
+                    new_q_times[self.instance.departure_times[h_idx]] = True
 
         return Label(
             node_id=to_nid,
@@ -218,17 +226,16 @@ class VCSPPricingProblem(PricingProblem):
 
     def _dominance_filter(self, labels):
         """Apply dominance: keep only non-dominated labels (by reduced_cost and duty_length)."""
+        if len(labels) <= 1:
+            return labels
+
+        ordered = sorted(labels, key=lambda l: (l.reduced_cost, l.duty_length))
         filtered = []
-        for i, l1 in enumerate(labels):
-            dominated = False
-            for j, l2 in enumerate(labels):
-                if i == j:
-                    continue
-                if l2.dominates(l1):
-                    dominated = True
-                    break
-            if not dominated:
-                filtered.append(l1)
+        best_duty_length = float('inf')
+        for label in ordered:
+            if label.duty_length < best_duty_length - 1e-10:
+                filtered.append(label)
+                best_duty_length = label.duty_length
         return filtered
 
     def solve(self, heuristic=True):
@@ -264,11 +271,11 @@ class VCSPPricingProblem(PricingProblem):
 
         new_columns = []
         for label in sink_labels:
-            if label.reduced_cost < -1e-6:
+            if label.d_trips and label.reduced_cost < -1e-6:
                 col = label.to_column(self.duty_type)
                 new_columns.append(col)
 
-        new_columns.sort(key=lambda c: c.cost)  # sort by actual cost
+        new_columns.sort(key=lambda c: c.reduced_cost)
 
         self.new_columns = new_columns
         return new_columns
@@ -279,4 +286,4 @@ class VCSPPricingProblem(PricingProblem):
             print(f"  Best actual cost: {self.new_columns[0].cost:.4f}")
 
     def has_negative_reduced_cost(self):
-        return any(c.cost < -1e-6 for c in self.new_columns)
+        return any(c.reduced_cost < -1e-6 for c in self.new_columns)

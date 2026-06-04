@@ -75,7 +75,12 @@ class DataCollector:
 
     @staticmethod
     def _column_hash(col):
-        return tuple(sorted(col.d_trips.keys()))
+        return (
+            tuple(sorted(col.d_trips.keys())),
+            tuple(sorted(col.f_trips.keys())),
+            tuple(sorted(col.g_trips.keys())),
+            tuple(sorted(col.q_times.keys())),
+        )
 
     def _initialize_columns(self):
         """Generate initial columns that leave room for CG improvement.
@@ -261,6 +266,7 @@ class DataCollector:
 
         no_improve_count = 0
         last_best_obj = float('inf')
+        early_stop_patience = self.config.get('early_stop_no_improve', None)
         total_labels_positive = 0
         total_labels_negative = 0
 
@@ -282,7 +288,7 @@ class DataCollector:
                 no_improve_count = 0
                 last_best_obj = obj
 
-            if no_improve_count >= 20 and iteration >= 10:
+            if early_stop_patience and no_improve_count >= early_stop_patience:
                 print(f"  Early LP termination (no improvement in {no_improve_count} iters)")
                 break
 

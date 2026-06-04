@@ -1,0 +1,41 @@
+{
+  "args": {
+    "data": "data_generation/training_data/vcsp_50",
+    "output": "gnn/models",
+    "epochs": 200,
+    "lr": 0.001,
+    "pos_weight": 10.0,
+    "hidden_dim": 32,
+    "num_iterations": 1,
+    "val_split": 0.25,
+    "batch_size": 16,
+    "seed": 42,
+    "patience": 50,
+    "min_delta": 0.0001,
+    "resume": null,
+    "save_every": 0,
+    "device": "cpu",
+    "no_normalize": false
+  },
+  "num_samples": 1775,
+  "train_size": 1332,
+  "val_size": 443,
+  "best_val_balanced_accuracy": 0.7928630113601685,
+  "final_train_metrics": {
+    "recall": 0.9020242691040039,
+    "tnr": 0.7225505113601685,
+    "precision": 0.43354737758636475,
+    "balanced_accuracy": 0.8122873902320862
+  },
+  "final_val_metrics": {
+    "recall": 0.8855491280555725,
+    "tnr": 0.7001768946647644,
+    "precision": 0.42961302399635315,
+    "balanced_accuracy": 0.7928630113601685
+  },
+  "model_parameters": 10849,
+  "history_csv": "gnn/models\\history.csv",
+  "best_model": "gnn/models\\best_model.pt",
+  "last_model": "gnn/models\\last_model.pt",
+  "norm_stats": "gnn/models\\norm_stats.npz"
+}

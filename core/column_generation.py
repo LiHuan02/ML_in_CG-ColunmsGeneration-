@@ -133,8 +133,13 @@ class VCSPSolver:
 
     @staticmethod
     def _column_hash(col):
-        """Hash a column by its covered d-trips (unique signature)."""
-        return tuple(sorted(col.d_trips.keys()))
+        """Hash a column by its full master-problem coefficient signature."""
+        return (
+            tuple(sorted(col.d_trips.keys())),
+            tuple(sorted(col.f_trips.keys())),
+            tuple(sorted(col.g_trips.keys())),
+            tuple(sorted(col.q_times.keys())),
+        )
 
     def solve(self, selection_strategy='no_selection', max_iterations=500, **kwargs):
         """Run the column generation algorithm."""
@@ -161,6 +166,7 @@ class VCSPSolver:
 
         no_improve_count = 0
         last_best_obj = float('inf')
+        early_stop_patience = self.config.get('early_stop_no_improve', None)
 
         for iteration in range(max_iterations):
             iter_start = time.time()
@@ -187,8 +193,7 @@ class VCSPSolver:
             else:
                 no_improve_count = 0
                 last_best_obj = obj
-            # Early LP termination: stop if no improvement in 5 iterations (paper strategy)
-            if no_improve_count >= 5 and iteration >= 5:
+            if early_stop_patience and no_improve_count >= early_stop_patience:
                 print(f"  ! No improvement in {no_improve_count} iterations - early LP termination")
                 break
 
@@ -220,6 +225,10 @@ class VCSPSolver:
                 if h not in self.column_hash_set:
                     self.column_hash_set.add(h)
                     unique_columns.append(col)
+
+            if not unique_columns:
+                print("  0 unique columns (all duplicates) - CG converged")
+                break
 
             # Select columns
             t0 = time.time()

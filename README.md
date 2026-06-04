@@ -1,12 +1,169 @@
 # VCSP Column Generation with Machine Learning Column Selection
 
+## 快速开始
+
+### 1. 安装依赖
+
+```bash
+pip install -r requirements.txt
+```
+
+建议在仓库根目录执行命令。Windows PowerShell 下直接运行 `python ...` 即可；如果你的环境找不到本地包，可先执行：
+
+```powershell
+$env:PYTHONPATH='.'
+```
+
+### 2. 生成训练数据
+
+训练数据由 `data_generation.generate` 生成。默认会：
+
+- 为每个实例运行 CG + MILP 选择
+- 保存每轮迭代的二分图特征到 `iter_XXXX.npz`
+- 额外保存 `metadata.npz`、`manifest.csv`、`generation_config.json`、`generation_summary.json`
+
+常用命令：
+
+```bash
+# 生成 30 trip、10 个实例的数据
+python -m data_generation.generate --trips 30 --instances 10
+
+# 生成论文规模附近的数据，例如 400 trip、100 个实例
+python -m data_generation.generate --trips 400 --instances 100 --workers 4
+
+# 指定输出目录并强制覆盖已有结果
+python -m data_generation.generate --trips 100 --instances 20 --output data/my_training_data --overwrite
+```
+
+常用参数：
+
+| 参数 | 说明 |
+|---|---|
+| `--trips` | 每个实例的 trip 数 |
+| `--instances` | 生成的实例数 |
+| `--output` | 输出目录，默认 `data_generation/training_data/vcsp_{trips}` |
+| `--max-iterations` | 每个实例最多 CG 迭代次数 |
+| `--workers` | 并行进程数，`1` 为串行 |
+| `--overwrite` | 覆盖已有实例目录 |
+| `--cost-inflation` | 初始列成本膨胀系数 |
+| `--artificial-cost` | 人工 f/g-trip 列成本 |
+| `--epsilon` | MILP 选择惩罚项 |
+| `--additional-pct` | 额外补充的负 reduced cost 列比例 |
+
+生成结果目录里每个实例会包含：
+
+- `iter_0000.npz`, `iter_0001.npz`, ...
+- `metadata.npz`
+- `manifest.csv`
+- `generation_config.json`
+- `generation_summary.json`
+
+### 3. 训练 GNN 模型
+
+训练入口是 `gnn.train`。脚本会自动读取数据目录下所有 `instance_XXXX/iter_XXXX.npz` 文件，默认按 75/25 划分训练集和验证集，并保存：
+
+- `best_model.pt`
+- `last_model.pt`
+- `history.csv`
+- `training_summary.json`
+- `norm_stats.npz`
+
+常用命令：
+
+```bash
+# 使用默认超参数训练
+python -m gnn.train --data data_generation/training_data/vcsp_400 --output gnn/models/vcsp_400
+
+# 指定 batch 累积、早停和随机种子
+python -m gnn.train \
+  --data data_generation/training_data/vcsp_400 \
+  --output gnn/models/vcsp_400 \
+  --epochs 200 \
+  --batch-size 16 \
+  --patience 30 \
+  --seed 42
+
+# 从已有 checkpoint 继续训练
+python -m gnn.train --data data_generation/training_data/vcsp_400 --output gnn/models/vcsp_400 --resume gnn/models/vcsp_400/last_model.pt
+```
+
+常用参数：
+
+| 参数 | 说明 |
+|---|---|
+| `--data` | 训练数据目录 |
+| `--output` | 模型和日志输出目录 |
+| `--epochs` | 最大训练轮数 |
+| `--batch-size` | 梯度累积的图数量 |
+| `--patience` | 验证集指标早停耐心值，`0` 表示关闭 |
+| `--min-delta` | 视为提升所需的最小增量 |
+| `--resume` | 从 checkpoint 恢复训练 |
+| `--save-every` | 每隔 N 轮保存一次中间 checkpoint |
+| `--no-normalize` | 关闭特征标准化 |
+
+### 4. 运行对比试验
+
+对比试验入口是 `experiments.comparison`，支持 `no_selection`、`milp`、`gnn` 三种策略，并会把每次实验的原始结果和汇总结果保存到输出目录。
+
+常用命令：
+
+```bash
+# 跑默认的 40/80 trip 对比实验
+python -m experiments.comparison
+
+# 指定 trip 规模、实例数和策略
+python -m experiments.comparison --trip-sizes 20,30,50 --instances 3 --strategies no_selection,milp,gnn
+
+# 指定 GNN 模型路径并保存结果
+python -m experiments.comparison \
+  --trip-sizes 300,400 \
+  --instances 5 \
+  --strategies no_selection,milp,gnn \
+  --gnn-model gnn/models/best_model.pt \
+  --norm-stats gnn/models/norm_stats.npz \
+  --output experiments/results/vcsp_compare
+```
+
+输出文件包括：
+
+- `results.json`
+- `results.csv`
+- `summary.csv`
+- `reductions.csv`
+
+### 5. 运行单次求解
+
+```bash
+# 无选择策略
+python main.py --trips 30 --selection no_selection
+
+# MILP 选择策略
+python main.py --trips 30 --selection milp
+
+# GNN 选择策略
+python main.py --trips 30 --selection gnn
+```
+
+`main.py` 的 `--selection` 支持：
+
+- `no_selection`
+- `milp`
+- `gnn`
+
+如果是 GNN 策略，请先确保 `gnn/models/best_model.pt` 和 `gnn/models/norm_stats.npz` 已存在，或在对比脚本中显式指定路径。
+
+---
+
+## 说明
+
+
 基于 EBSCO 论文（Morabit, Desaulniers, Lodi, 2021）实现的车辆与乘务员联合调度问题（VCSP）列生成求解器，集成机器学习（GNN）列选择策略。
 
 ## 目录
 
 - [数学模型](#数学模型)
 - [项目架构](#项目架构)
-- [快速开始](#快速开始)
+- [快速开始 (更新后)](#快速开始-更新后)
 - [列生成框架](#列生成框架)
 - [列选择策略](#列选择策略)
 - [GNN训练数据生成](#gnn训练数据生成)
@@ -14,6 +171,23 @@
 - [实验与对比](#实验与对比)
 - [命令行参数](#命令行参数)
 - [参考文献](#参考文献)
+
+---
+
+## 实验与对比
+
+下表使用 `experiments/results/latest/summary.csv` 的聚合统计（示例运行）。字段说明：`avg_total_time` 单位为秒，`avg_objective` 为最终目标值，其他为均值。
+
+| num_trips | selection     | runs | avg_total_time (s) | std_total_time | avg_iterations | avg_final_columns | avg_columns_generated | avg_columns_selected | avg_objective | avg_buses |
+|-----------:|:--------------|:-----:|-------------------:|---------------:|---------------:|------------------:|---------------------:|--------------------:|--------------:|---------:|
+| 40        | gnn          | 2    | 8.4543            | 7.2138         | 76.5           | 303.0             | 745.0                | 223.0               | 2644210.89   | 10.3462  |
+| 40        | milp         | 2    | 18.6265           | 1.8266         | 139.5          | 734.5             | 1171.0               | 654.5               | 1630833.10   | 8.42     |
+| 40        | no_selection | 2    | 16.7330           | 0.1826         | 159.0          | 1155.0            | 1075.0               | 1075.0              | 1629481.88   | 8.4375   |
+| 80        | gnn          | 2    | 13.0437           | 0.4850         | 18.5           | 216.5             | 218.5                | 56.5                | 8202598.43   | 24.5     |
+| 80        | milp         | 2    | 225.4577          | 49.2432        | 258.0          | 1675.5            | 2977.0               | 1515.5              | 2888515.94   | 14.0492  |
+| 80        | no_selection | 2    | 221.5217          | 5.7809         | 300.0          | 3302.5            | 3155.0               | 3142.5              | 2871258.92   | 14.0     |
+
+如需我将该表格自动同步到 README（从 CSV 读取并更新），或添加可视化图表（PNG/SVG）并把图片链接到 README，请告诉我偏好。
 
 ---
 
@@ -102,36 +276,7 @@ ColunmsGeneration(CG)/
 
 ---
 
-## 快速开始
 
-### 安装依赖
-
-```bash
-pip install -r requirements.txt
-```
-
-依赖：`numpy`, `ortools`, `torch`
-
-### 运行列生成
-
-```bash
-# 无选择策略 (NO-S)
-PYTHONPATH=. python main.py --trips 30 --selection no_selection
-
-# MILP 选择策略 (MILP-S)
-PYTHONPATH=. python main.py --trips 30 --selection milp
-
-# GNN 选择策略 (GNN-S) — 需要先训练模型
-PYTHONPATH=. python main.py --trips 30 --selection gnn
-```
-
-### 运行对比实验
-
-```bash
-PYTHONPATH=. python experiments/comparison.py
-```
-
----
 
 ## 列生成框架
 
@@ -342,6 +487,19 @@ PYTHONPATH=. python -m gnn.train --data data/combined --device cuda
 ---
 
 ## 实验与对比
+
+以下为基于 `experiments/results/latest` 的简要汇总（示例运行，num_trips=40/80，各策略对比）：
+
+- 对于 40 trips：
+  - `gnn` 平均总耗时约 8.45s，平均迭代 76.5 次，平均最终列数 303，平均选中列 ~223。目标值显著高于 `milp`/`no_selection`（分别为 1.63e6 / 1.63e6 左右），但运行速度快得多。
+  - `milp` 平均总耗时约 18.63s，平均迭代 139.5 次，平均最终列数 734.5，平均选中列 ~654.5。
+  - `no_selection` 平均总耗时约 16.73s，平均迭代 159 次，平均最终列数 1155。
+
+- 对于 80 trips：
+  - `gnn` 平均总耗时约 13.04s，平均迭代 18.5 次，平均最终列数 216.5，平均选中列 ~56.5，但目标值偏高（示例中约 8.2e6）。
+  - `milp` 与 `no_selection` 运行时间显著更长（均在 200s+），并生成更多列与更大最终列数。
+
+以上结果来自 `experiments/results/latest/summary.csv` 的聚合统计，用于 README 中的简要说明。若需更详细的表格或可视化，请告知要包含的字段（例如 `avg_total_time`、`avg_iterations`、`avg_objective` 等）。
 
 ### 运行对比
 

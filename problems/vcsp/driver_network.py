@@ -105,17 +105,19 @@ class DriverNetwork:
             end_nid = self._node_id('end_of_trip', tid)
             self._add_d_trip_arc(relief_nid, end_nid, d2, instance.cost_per_minute)
 
-        # Start of duty arcs: source -> any node (start_of_trip, relief, end_of_trip)
+        # Start of duty arcs: source -> feasible first work nodes.
+        # Starting at an end_of_trip node would create duties with no d-trip service.
         for trip in instance.trips:
             tid = trip['id']
-            for node_type in ['start_of_trip', 'relief', 'end_of_trip']:
+            for node_type in ['start_of_trip', 'relief']:
                 nid = self._node_id(node_type, tid)
                 self._add_start_of_duty_arc(nid, instance)
 
-        # End of duty arcs: any node -> sink
+        # End of duty arcs: feasible last work nodes.
+        # Ending at a start_of_trip node would create duties with no d-trip service.
         for trip in instance.trips:
             tid = trip['id']
-            for node_type in ['start_of_trip', 'relief', 'end_of_trip']:
+            for node_type in ['relief', 'end_of_trip']:
                 nid = self._node_id(node_type, tid)
                 self._add_end_of_duty_arc(nid, instance)
 
@@ -160,7 +162,7 @@ class DriverNetwork:
         travel_time = instance.driving_time('depot', to_node['location'])
         total_time = instance.sign_on_time + travel_time
 
-        cost = total_time * instance.cost_per_minute
+        cost = total_time * instance.cost_per_minute + instance.driver_fixed_cost
 
         self.arcs[(self.NODE_SOURCE, to_nid)] = {
             'type': self.ARC_START_OF_DUTY,
@@ -209,13 +211,15 @@ class DriverNetwork:
         # Driving arc
         drive_time = instance.driving_time(i_loc, j_loc)
         if end_time + drive_time <= start_time:
-            cost = drive_time * instance.cost_per_minute
+            elapsed_time = start_time - end_time
+            cost = elapsed_time * instance.cost_per_minute
             self.arcs[(i_end_nid, j_start_nid)] = {
                 'type': self.ARC_INTER_TRIP_DRIVING,
                 'trip_id': trip_j['id'],
                 'cost': cost,
                 'reduced_cost': cost,
-                'time': drive_time,
+                'time': elapsed_time,
+                'travel_time': drive_time,
                 'from_location': i_loc,
                 'to_location': j_loc,
                 'is_driving': True,
@@ -224,13 +228,15 @@ class DriverNetwork:
         # Walking arc
         walk_time = instance.walking_time(i_loc, j_loc)
         if end_time + walk_time <= start_time:
-            cost = walk_time * instance.cost_per_minute
+            elapsed_time = start_time - end_time
+            cost = elapsed_time * instance.cost_per_minute
             self.arcs[(i_end_nid, j_start_nid, 'walk')] = {
                 'type': self.ARC_INTER_TRIP_WALKING,
                 'trip_id': trip_j['id'],
                 'cost': cost,
                 'reduced_cost': cost,
-                'time': walk_time,
+                'time': elapsed_time,
+                'travel_time': walk_time,
                 'from_location': i_loc,
                 'to_location': j_loc,
                 'is_driving': False,
@@ -251,13 +257,15 @@ class DriverNetwork:
             # Driving
             drive_time = instance.driving_time(i_loc, target_loc)
             if i_relief_time + drive_time <= target_time:
-                cost = drive_time * instance.cost_per_minute
+                elapsed_time = target_time - i_relief_time
+                cost = elapsed_time * instance.cost_per_minute
                 self.arcs[(i_relief_nid, target_nid)] = {
                     'type': self.ARC_INTER_TRIP_DRIVING,
                     'trip_id': target_trip_id,
                     'cost': cost,
                     'reduced_cost': cost,
-                    'time': drive_time,
+                    'time': elapsed_time,
+                    'travel_time': drive_time,
                     'from_location': i_loc,
                     'to_location': target_loc,
                     'is_driving': True,
@@ -266,13 +274,15 @@ class DriverNetwork:
             # Walking
             walk_time = instance.walking_time(i_loc, target_loc)
             if i_relief_time + walk_time <= target_time:
-                cost = walk_time * instance.cost_per_minute
+                elapsed_time = target_time - i_relief_time
+                cost = elapsed_time * instance.cost_per_minute
                 self.arcs[(i_relief_nid, target_nid, 'walk')] = {
                     'type': self.ARC_INTER_TRIP_WALKING,
                     'trip_id': target_trip_id,
                     'cost': cost,
                     'reduced_cost': cost,
-                    'time': walk_time,
+                    'time': elapsed_time,
+                    'travel_time': walk_time,
                     'from_location': i_loc,
                     'to_location': target_loc,
                     'is_driving': False,

@@ -16,6 +16,9 @@ import os
 import sys
 import time
 import argparse
+import csv
+import json
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 
 # Ensure project root is in path
@@ -27,7 +30,7 @@ from problems.vcsp.instance import VCSPInstance
 from data_generation.data_collector import DataCollector
 
 
-def generate_single_instance(instance_id, num_trips, seed, config, output_base_dir):
+def generate_single_instance(instance_id, num_trips, seed, config, output_base_dir, overwrite=False):
     """Generate data from a single VCSP instance.
 
     Returns:
@@ -39,12 +42,22 @@ def generate_single_instance(instance_id, num_trips, seed, config, output_base_d
 
     # Skip if already done
     metadata_path = os.path.join(output_dir, 'metadata.npz')
-    if os.path.exists(metadata_path):
+    if os.path.exists(metadata_path) and not overwrite:
         try:
             meta = np.load(metadata_path)
             n = int(meta['num_data_points'])
             print(f"  [SKIP] Instance {instance_id} already exists ({n} data points)")
-            return n, 0.0, True
+            return {
+                'instance_id': instance_id,
+                'num_trips': num_trips,
+                'seed': seed,
+                'num_data_points': n,
+                'elapsed': 0.0,
+                'success': True,
+                'skipped': True,
+                'output_dir': output_dir,
+                'error': '',
+            }
         except Exception:
             pass  # Corrupted, regenerate
 
@@ -61,13 +74,50 @@ def generate_single_instance(instance_id, num_trips, seed, config, output_base_d
         n_points = collector.save(output_dir)
         elapsed = collector.stats['total_time']
 
-        return n_points, elapsed, True
+        return {
+            'instance_id': instance_id,
+            'num_trips': num_trips,
+            'seed': seed,
+            'num_data_points': n_points,
+            'elapsed': elapsed,
+            'success': True,
+            'skipped': False,
+            'output_dir': output_dir,
+            'error': '',
+        }
 
     except Exception as e:
         print(f"  [FAIL] Instance {instance_id}: {e}")
         import traceback
         traceback.print_exc()
-        return 0, 0.0, False
+        return {
+            'instance_id': instance_id,
+            'num_trips': num_trips,
+            'seed': seed,
+            'num_data_points': 0,
+            'elapsed': 0.0,
+            'success': False,
+            'skipped': False,
+            'output_dir': output_dir,
+            'error': str(e),
+        }
+
+
+def _write_json(path, payload):
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+
+
+def _write_manifest_csv(path, rows):
+    fieldnames = [
+        'instance_id', 'num_trips', 'seed', 'num_data_points', 'elapsed',
+        'success', 'skipped', 'output_dir', 'error',
+    ]
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, '') for k in fieldnames})
 
 
 def main():
@@ -98,6 +148,12 @@ def main():
                         help='Cost for artificial f/g trip columns (default: 1e7)')
     parser.add_argument('--seed-base', type=int, default=42,
                         help='Base seed for instance generation (default: 42)')
+    parser.add_argument('--workers', type=int, default=1,
+                        help='Parallel worker processes (default: 1)')
+    parser.add_argument('--overwrite', action='store_true',
+                        help='Regenerate instances even if metadata.npz exists')
+    parser.add_argument('--early-stop-no-improve', type=int, default=None,
+                        help='Optional CG early-stop patience; disabled by default')
 
     args = parser.parse_args()
 
@@ -120,7 +176,20 @@ def main():
         'skip_first_n_iterations': args.skip_first,
         'cost_inflation_factor': args.cost_inflation,
         'artificial_cost': args.artificial_cost,
+        'early_stop_no_improve': args.early_stop_no_improve,
     }
+
+    run_config = {
+        'trips': args.trips,
+        'instances': args.instances,
+        'start_id': args.start_id,
+        'seed_base': args.seed_base,
+        'workers': args.workers,
+        'overwrite': args.overwrite,
+        'output_base_dir': output_base_dir,
+        'collector_config': config,
+    }
+    _write_json(os.path.join(output_base_dir, 'generation_config.json'), run_config)
 
     print("=" * 60)
     print("VCSP TRAINING DATA GENERATION")
@@ -138,14 +207,26 @@ def main():
 
     start_all = time.time()
 
-    for i in range(args.start_id, args.start_id + args.instances):
-        seed = args.seed_base * 1000 + i * 137 + args.trips
-        n_points, elapsed, ok = generate_single_instance(
-            i, args.trips, seed, config, output_base_dir
-        )
-        if ok:
-            total_data_points += n_points
-            total_time += elapsed
+    instance_args = []
+    for instance_id in range(args.start_id, args.start_id + args.instances):
+        seed = args.seed_base * 1000 + instance_id * 137 + args.trips
+        instance_args.append((instance_id, args.trips, seed, config, output_base_dir, args.overwrite))
+
+    results = []
+    if args.workers <= 1:
+        for item in instance_args:
+            results.append(generate_single_instance(*item))
+    else:
+        with ProcessPoolExecutor(max_workers=args.workers) as executor:
+            futures = [executor.submit(generate_single_instance, *item) for item in instance_args]
+            for fut in as_completed(futures):
+                results.append(fut.result())
+
+    results.sort(key=lambda r: r['instance_id'])
+    for row in results:
+        if row['success']:
+            total_data_points += row['num_data_points']
+            total_time += row['elapsed']
             success_count += 1
 
     total_wall = time.time() - start_all
@@ -161,6 +242,27 @@ def main():
     if total_data_points > 0:
         print(f"Avg data points per instance: {total_data_points / max(1, success_count):.1f}")
     print(f"Output: {output_base_dir}")
+
+    skipped_count = sum(1 for r in results if r['skipped'])
+    failed_count = sum(1 for r in results if not r['success'])
+    summary = {
+        'success_count': success_count,
+        'failed_count': failed_count,
+        'skipped_count': skipped_count,
+        'requested_instances': args.instances,
+        'total_data_points': total_data_points,
+        'total_compute_time': total_time,
+        'total_wall_time': total_wall,
+        'avg_time_per_success': total_time / max(1, success_count),
+        'avg_data_points_per_success': total_data_points / max(1, success_count),
+        'output_base_dir': output_base_dir,
+        'results': results,
+        'config': run_config,
+    }
+    _write_json(os.path.join(output_base_dir, 'generation_summary.json'), summary)
+    _write_manifest_csv(os.path.join(output_base_dir, 'manifest.csv'), results)
+    print(f"Saved manifest: {os.path.join(output_base_dir, 'manifest.csv')}")
+    print(f"Saved summary: {os.path.join(output_base_dir, 'generation_summary.json')}")
 
     # Estimate: paper reports ~7,000 data points from 100 instances of 400 trips
     if total_data_points > 0:

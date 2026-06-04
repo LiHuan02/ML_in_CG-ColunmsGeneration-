@@ -60,7 +60,7 @@ class SortSelectionCG:
         self.n_select = self.config.get('n_select', 50)
 
     def select(self, columns):
-        sorted_cols = sorted(columns, key=lambda c: c.cost)
+        sorted_cols = sorted(columns, key=lambda c: c.reduced_cost)
         return sorted_cols[:self.n_select]
 
 
