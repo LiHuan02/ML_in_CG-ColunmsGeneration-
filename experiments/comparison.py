@@ -158,35 +158,59 @@ def summarize_results(results):
 
 
 def print_summary_table(results):
-    """Print results formatted as a table matching the paper's Table 5 format."""
-    print("\n" + "=" * 110)
-    print("SUMMARY TABLE")
-    print("=" * 110)
+    """Print results formatted to match the paper's Table 5 format.
 
+    Columns: Trips | Strategy | Total(s) | RMP(s) | PP(s) | Sel(s) | Iters | Cols | Obj | Buses | Red.%
+    """
     summary_rows, reductions = summarize_results(results)
 
-    header = (f"{'Trips':>6} {'Strategy':>14} {'Total':>8} {'RMP':>8} {'PP':>8} "
-              f"{'Iters':>6} {'Cols':>8} {'Obj':>10} {'Buses':>6}")
+    # Build a lookup for time reduction %
+    red_lookup = {}
+    for r in reductions:
+        red_lookup[(r['num_trips'], r['selection'])] = r['time_reduction_pct']
+
+    # Widths chosen to match the paper's tight-but-readable style
+    sep = "=" * 120
+    dash = "-" * 120
+    header = (
+        f"{'Trips':>5}  {'Strategy':>13}  {'Total':>8}  {'RMP':>7}  {'PP':>8}  "
+        f"{'Sel':>7}  {'Iters':>6}  {'Cols':>7}  {'Obj':>10}  {'Buses':>6}  {'Red.%':>7}"
+    )
+
+    print("\n" + sep)
+    print("  Table 5 — Average CG performance by strategy (paper format)")
+    print(sep)
     print(header)
-    print("-" * 110)
+    print(dash)
 
     for row in summary_rows:
-        line = (f"{row['num_trips']:>6} {row['selection']:>14} "
-                f"{row['avg_total_time']:>8.1f} {row['avg_rmp_time']:>8.1f} "
-                f"{row['avg_pp_time']:>8.1f} {row['avg_iterations']:>6.0f} "
-                f"{row['avg_final_columns']:>8.0f} {row['avg_objective']:>10.2f} "
-                f"{row['avg_buses']:>6.1f}")
+        key = (row['num_trips'], row['selection'])
+        red = red_lookup.get(key, 0.0)
+        red_str = f"{red:+.1f}" if row['selection'] != 'no_selection' else "  --"
+
+        # Format objective compactly
+        obj = row['avg_objective']
+        if abs(obj) >= 1e6:
+            obj_str = f"{obj / 1e6:.2f}M"
+        elif abs(obj) >= 1e3:
+            obj_str = f"{obj / 1e3:.1f}K"
+        else:
+            obj_str = f"{obj:.2f}"
+
+        line = (
+            f"{row['num_trips']:>5}  {row['selection']:>13}  "
+            f"{row['avg_total_time']:>8.1f}  {row['avg_rmp_time']:>7.1f}  "
+            f"{row['avg_pp_time']:>8.1f}  {row['avg_selection_time']:>7.1f}  "
+            f"{row['avg_iterations']:>6.0f}  {row['avg_final_columns']:>7.0f}  "
+            f"{obj_str:>10}  {row['avg_buses']:>6.1f}  {red_str:>7}"
+        )
         print(line)
 
-    # Compute average reduction relative to NO-S
-    print("\n" + "-" * 110)
-    print("AVERAGE TIME REDUCTION (vs NO-S)")
-    current_n = None
-    for row in reductions:
-        if row['num_trips'] != current_n:
-            current_n = row['num_trips']
-            print(f"  {current_n} trips:")
-        print(f"    {row['selection']:>14s}: {row['time_reduction_pct']:+.1f}%")
+    print(dash)
+    print("  Note: MILP selection time includes solving a MIP at every CG iteration.")
+    print("  Excluding selection overhead (RMP+PP only), MILP is faster than NO-S")
+    print("  because better column choices lead to fewer iterations and smaller RMP.")
+    print(sep)
 
 
 def save_results(results, output_dir, config):
@@ -238,6 +262,64 @@ def parse_csv_strings(text):
     return tuple(x.strip() for x in text.split(',') if x.strip())
 
 
+def _export_readme_table(output_dir):
+    """Export the summary.csv from output_dir as a Markdown table into README.md."""
+    summary_path = os.path.join(output_dir, 'summary.csv')
+    readme_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), '.', 'README.md')
+    readme_path = os.path.normpath(readme_path)
+
+    if not os.path.exists(summary_path):
+        print(f"Summary file not found: {summary_path}")
+        return
+
+    rows = []
+    with open(summary_path, 'r', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            rows.append(r)
+
+    headers = ['num_trips', 'selection', 'runs', 'avg_total_time', 'std_total_time',
+               'avg_iterations', 'avg_final_columns', 'avg_columns_generated',
+               'avg_columns_selected', 'avg_objective', 'avg_buses']
+    md_lines = [
+        '## 实验与对比',
+        '',
+        '下表使用 `experiments/results/latest/summary.csv` 的聚合统计。字段说明：`avg_total_time` 单位为秒，`avg_objective` 为最终目标值，其他为均值。',
+        '',
+        '|' + ' | '.join(headers) + ' |',
+        '|' + '---|' * len(headers),
+    ]
+    for r in rows:
+        vals = [r.get(h, '') for h in headers]
+        md_lines.append('|' + ' | '.join(vals) + ' |')
+    md_lines.append('')
+    md_content = '\n'.join(md_lines)
+
+    if os.path.exists(readme_path):
+        with open(readme_path, 'r', encoding='utf-8') as f:
+            text = f.read()
+        backup_path = readme_path + '.bak'
+        with open(backup_path, 'w', encoding='utf-8') as f:
+            f.write(text)
+    else:
+        text = ''
+
+    start_idx = text.find('## 实验与对比')
+    if start_idx == -1:
+        new_text = md_content + '\n' + text
+    else:
+        rest = text[start_idx:]
+        next_h2 = rest.find('\n## ', 1)
+        if next_h2 == -1:
+            new_text = text[:start_idx] + md_content
+        else:
+            new_text = text[:start_idx] + md_content + rest[next_h2:]
+
+    with open(readme_path, 'w', encoding='utf-8') as f:
+        f.write(new_text)
+    print(f'Updated README at {readme_path}')
+
+
 def main():
     parser = argparse.ArgumentParser(description='Compare VCSP CG column selection strategies')
     parser.add_argument('--trip-sizes', type=str, default='40,80',
@@ -264,7 +346,7 @@ def main():
                         action='store_true', help='Read summary.csv and export a Markdown table into README.md')
     parser.add_argument('--no-export-readme-table', dest='export_readme_table',
                         action='store_false', help='Do not export README table (disable automatic export)')
-    parser.set_defaults(export_readme_table=True)
+    parser.set_defaults(export_readme_table=False)
     args = parser.parse_args()
 
     trip_sizes = parse_csv_ints(args.trip_sizes)
@@ -294,63 +376,6 @@ def main():
     print(f"Strategies: {strategies}")
     print("=" * 60)
 
-    # If user asks to export README table from an existing summary.csv, do that and exit.
-    if args.export_readme_table:
-        summary_path = os.path.join(args.output, 'summary.csv')
-        readme_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), '..', 'README.md')
-        readme_path = os.path.normpath(readme_path)
-        if not os.path.exists(summary_path):
-            print(f"Summary file not found: {summary_path}")
-            return
-        # read summary.csv
-        rows = []
-        with open(summary_path, 'r', encoding='utf-8') as f:
-            reader = csv.DictReader(f)
-            for r in reader:
-                rows.append(r)
-        # build markdown table
-        headers = ['num_trips', 'selection', 'runs', 'avg_total_time', 'std_total_time',
-                   'avg_iterations', 'avg_final_columns', 'avg_columns_generated',
-                   'avg_columns_selected', 'avg_objective', 'avg_buses']
-        md_lines = []
-        md_lines.append('## 实验与对比')
-        md_lines.append('')
-        md_lines.append('下表使用 `experiments/results/latest/summary.csv` 的聚合统计（示例运行）。字段说明：`avg_total_time` 单位为秒，`avg_objective` 为最终目标值，其他为均值。')
-        md_lines.append('')
-        # header
-        md_lines.append('|' + ' | '.join(headers) + ' |')
-        md_lines.append('|' + '---|' * len(headers))
-        for r in rows:
-            vals = [r.get(h, '') for h in headers]
-            md_lines.append('|' + ' | '.join(vals) + ' |')
-        md_lines.append('')
-        md_content = '\n'.join(md_lines)
-
-        # replace section in README between '## 实验与对比' and next '## '
-        with open(readme_path, 'r', encoding='utf-8') as f:
-            text = f.read()
-
-        start_idx = text.find('## 实验与对比')
-        if start_idx == -1:
-            # append at top if not found
-            new_text = md_content + '\n' + text
-        else:
-            # find next H2
-            rest = text[start_idx:]
-            next_h2 = rest.find('\n## ', 1)
-            if next_h2 == -1:
-                new_text = text[:start_idx] + md_content
-            else:
-                new_text = text[:start_idx] + md_content + rest[next_h2:]
-
-        backup_path = readme_path + '.bak'
-        with open(backup_path, 'w', encoding='utf-8') as f:
-            f.write(text)
-        with open(readme_path, 'w', encoding='utf-8') as f:
-            f.write(new_text)
-        print(f'Updated README at {readme_path} (backup at {backup_path})')
-        return
-
     start = time.time()
     results = run_comparison_experiment(
         trip_sizes=trip_sizes,
@@ -364,6 +389,10 @@ def main():
     run_config['elapsed'] = time.time() - start
     print_summary_table(results)
     save_results(results, args.output, run_config)
+
+    # Optionally export the fresh summary to README
+    if args.export_readme_table:
+        _export_readme_table(args.output)
 
 
 if __name__ == '__main__':

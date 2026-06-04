@@ -83,68 +83,66 @@ class DataCollector:
         )
 
     def _initialize_columns(self):
-        """Generate initial columns that leave room for CG improvement.
+        """Generate initial columns using the same heuristic as VCSPSolver.
 
-        Strategy: Create one column per d-trip (at inflated cost) covering ONLY
-        the d-trip constraint (no f/g trips). Add separate high-cost artificial
-        columns for f_trip and g_trip constraints. This ensures RMP feasibility
-        while creating clear opportunities for PP to find cheaper columns that
-        combine d_trip + f_trip + g_trip coverage.
-
-        Config keys:
-          cost_inflation_factor: multiplier for d-trip column costs (default 3.0)
-          artificial_cost: cost for artificial f/g trip columns (default 1e7)
+        One duty per d-trip half, each covering the d-trip plus the matching
+        f_trip (first half) or g_trip (second half) at actual cost.
+        This matches the inference-time initialization in VCSPSolver exactly.
         """
-        inflation = self.config.get('cost_inflation_factor', 3.0)
-        artificial_cost = self.config.get('artificial_cost', 1e7)
         driver_fixed = self.instance.driver_fixed_cost
 
         initial_cols = []
 
-        # 1. One column per d-trip: covers d_trip ONLY (no f/g trips), inflated cost
         for trip in self.instance.trips:
             tid = trip['id']
-            for d, is_first in [(trip['d_trips'][0], True), (trip['d_trips'][1], False)]:
-                drive_to = self.instance.driving_time('depot', d['start_location'])
-                drive_back = self.instance.driving_time(d['end_location'], 'depot')
-                total_time = (self.instance.sign_on_time + drive_to +
-                              d['duration'] + drive_back + self.instance.sign_off_time)
-                cost = (total_time * self.instance.cost_per_minute + driver_fixed) * inflation
+            d0 = trip['d_trips'][0]  # start -> relief
+            d1 = trip['d_trips'][1]  # relief -> end
 
-                col = VCSPColumn(
-                    duty_type='I', cost=cost,
-                    node_sequence=[], arc_sequence=[],
-                    d_trips={d['id']: True},
-                    f_trips={}, g_trips={}, q_times={},
-                    duty_length=total_time,
-                )
-                bus_leave = d['start_time'] - drive_to - self.instance.sign_on_time
-                bus_return = d['end_time'] + drive_back + self.instance.sign_off_time
-                for h in self.instance.departure_times:
-                    if bus_leave <= h < bus_return:
-                        col.q_times[h] = True
-                initial_cols.append(col)
+            # Column for d-trip 0: depot -> start_of_trip -> relief -> depot
+            drive_to_0 = self.instance.driving_time('depot', d0['start_location'])
+            drive_back_0 = self.instance.driving_time(d0['end_location'], 'depot')
+            total_time_0 = (self.instance.sign_on_time + drive_to_0 +
+                            d0['duration'] + drive_back_0 + self.instance.sign_off_time)
+            cost_0 = total_time_0 * self.instance.cost_per_minute
 
-        # 2. Artificial columns for f_trip (bus arrival) constraints: very high cost
-        num_d_trips = self.instance.num_d_trips
-        for w_id in range(self.instance.num_trips):
-            col = VCSPColumn(
-                duty_type='I', cost=artificial_cost,
+            col0 = VCSPColumn(
+                duty_type='I',
+                cost=cost_0 + driver_fixed,
                 node_sequence=[], arc_sequence=[],
-                d_trips={}, f_trips={w_id: True}, g_trips={}, q_times={},
-                duty_length=0,
+                d_trips={d0['id']: True},
+                f_trips={tid: True},
+                g_trips={},
+                q_times={},
             )
-            initial_cols.append(col)
+            bus_leave_0 = d0['start_time'] - drive_to_0 - self.instance.sign_on_time
+            bus_return_0 = d0['end_time'] + drive_back_0 + self.instance.sign_off_time
+            for h in self.instance.departure_times:
+                if bus_leave_0 <= h < bus_return_0:
+                    col0.q_times[h] = True
+            initial_cols.append(col0)
 
-        # 3. Artificial columns for g_trip (bus departure) constraints: very high cost
-        for w_id in range(self.instance.num_trips):
-            col = VCSPColumn(
-                duty_type='I', cost=artificial_cost,
+            # Column for d-trip 1: depot -> relief -> end_of_trip -> depot
+            drive_to_1 = self.instance.driving_time('depot', d1['start_location'])
+            drive_back_1 = self.instance.driving_time(d1['end_location'], 'depot')
+            total_time_1 = (self.instance.sign_on_time + drive_to_1 +
+                            d1['duration'] + drive_back_1 + self.instance.sign_off_time)
+            cost_1 = total_time_1 * self.instance.cost_per_minute
+
+            col1 = VCSPColumn(
+                duty_type='I',
+                cost=cost_1 + driver_fixed,
                 node_sequence=[], arc_sequence=[],
-                d_trips={}, f_trips={}, g_trips={w_id: True}, q_times={},
-                duty_length=0,
+                d_trips={d1['id']: True},
+                f_trips={},
+                g_trips={tid: True},
+                q_times={},
             )
-            initial_cols.append(col)
+            bus_leave_1 = d1['start_time'] - drive_to_1 - self.instance.sign_on_time
+            bus_return_1 = d1['end_time'] + drive_back_1 + self.instance.sign_off_time
+            for h in self.instance.departure_times:
+                if bus_leave_1 <= h < bus_return_1:
+                    col1.q_times[h] = True
+            initial_cols.append(col1)
 
         self.rmp.add_columns(initial_cols)
         for col in initial_cols:

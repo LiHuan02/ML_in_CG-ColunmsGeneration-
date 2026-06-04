@@ -3,7 +3,7 @@ import numpy as np
 from problems.vcsp.vcsp_rmp import VCSPRMP
 from problems.vcsp.vcsp_pp import VCSPPricingProblem
 from problems.vcsp.driver_network import DriverNetwork
-from selection.no_selection import NoSelectionCG
+from selection.no_selection import NoSelectionCG, SortSelectionCG
 from selection.milp_selection import MILPSelectionCG
 from selection.gnn_selection import GNNSelectionCG
 
@@ -120,16 +120,19 @@ class VCSPSolver:
 
     def _remove_columns(self):
         """Remove columns from RMP when it exceeds max size.
-        Keep the n_min_cols most promising columns.
+        Keep the n_min_cols columns with best (lowest) reduced cost.
         """
         if len(self.rmp.columns) <= self.n_max_cols:
             return
 
-        # Sort by reduced cost (using last known dual values)
-        # Keep only n_min_cols
         n_remove = len(self.rmp.columns) - self.n_min_cols
-        # Simple strategy: keep the first n_min_cols (added earlier)
-        self.rmp.columns = self.rmp.columns[n_remove:]
+        # Sort indices by reduced cost ascending (keep best columns)
+        sorted_indices = sorted(
+            range(len(self.rmp.columns)),
+            key=lambda i: self.rmp.columns[i].reduced_cost,
+        )
+        keep_indices = set(sorted_indices[n_remove:])
+        self.rmp.columns = [c for i, c in enumerate(self.rmp.columns) if i in keep_indices]
 
     @staticmethod
     def _column_hash(col):
@@ -155,6 +158,8 @@ class VCSPSolver:
             selector = MILPSelectionCG(self.rmp, None, self.config)
         elif selection_strategy == 'gnn':
             selector = GNNSelectionCG(self.rmp, None, self.config)
+        elif selection_strategy == 'sort':
+            selector = SortSelectionCG(self.rmp, None, self.config)
         else:
             raise ValueError(f"Unknown selection strategy: {selection_strategy}")
 

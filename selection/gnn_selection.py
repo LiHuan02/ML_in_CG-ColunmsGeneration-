@@ -32,6 +32,7 @@ class GNNSelectionCG:
         # Selection parameters (Table 4)
         self.n_max_blks = self.config.get('n_max_blks', 14)
         self.min_select = self.config.get('min_select', 5)
+        self.select_ratio = self.config.get('select_ratio', 0.3)  # Top-K ratio
 
         # Feature extractor
         self.feature_extractor = FeatureExtractor(rmp.instance)
@@ -199,17 +200,14 @@ class GNNSelectionCG:
             logits = self.model(cf_t, ctf_t, ei_t)
             probs = torch.sigmoid(logits).cpu().numpy()
 
-        # Select new columns with probability > 0.5
+        # Select top-K new columns by GNN probability (instead of fixed threshold)
         new_probs = probs[new_col_start:]
-        selected_mask = new_probs > 0.5
+        n_candidates = len(candidate_cols)
+        k = max(self.min_select, int(n_candidates * self.select_ratio))
+        k = min(k, n_candidates)
 
-        selected = [candidate_cols[i] for i in range(len(candidate_cols)) if selected_mask[i]]
-
-        # If too few selected, add by reduced cost
-        if len(selected) < max(1, len(candidate_cols) * 0.1):
-            n_extra = max(1, int(len(candidate_cols) * 0.3))
-            sorted_candidates = sorted(candidate_cols, key=lambda c: c.reduced_cost)
-            selected = sorted_candidates[:n_extra]
+        top_indices = np.argsort(new_probs)[::-1][:k]
+        selected = [candidate_cols[i] for i in range(n_candidates) if i in top_indices]
 
         n_selected = len(selected)
         print(f"  GNN-S: {n_selected}/{len(candidate_cols)} columns selected "
